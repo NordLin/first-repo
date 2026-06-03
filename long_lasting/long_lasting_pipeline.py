@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """long-lasting 合规标注流水线.
 
-将"抽取 / 切句 / 标注"拆成确定性脚本步骤 + 一个纯分类 LLM 步骤, 对应三个子命令:
+将"抽取 / 切句 / 标注"拆成确定性脚本步骤 + 一个纯分类 LLM 步骤, 对应两个子命令:
 
   extract  从原始数据中筛选 "合并接口禁售词" 含 long-lasting 的记录,
            按标点把 "ListingV2原文" 切成片段(每段最多一个 long-lasting 关键词),
@@ -11,8 +11,13 @@
            输出 long_lasting_LLM抽样生成数据.jsonl. 未配置 API 时使用内置启发式标注器,
            便于离线试跑(结果应再经人工/LLM 复核).
 
-设计说明见同目录 README.md。脚本只依赖标准库; 读 .xlsx 时需要 pandas+openpyxl,
-调用真实 LLM 时需要环境变量 OPENAI_API_KEY(可选 OPENAI_BASE_URL)。
+标注核心规则(与提示词一致):
+  long-lasting 描述普通商品属性/耐用性/寿命/颜色香味续航/涂层结构 -> 正样本;
+  long-lasting 与健康/安全/杀菌/抗菌/防虫/驱虫/防蛀等功效绑定 -> 负样本。
+  (香味 fragrance/scent 本身不算负样本, 只有用于驱虫/杀菌等功效时才判负。)
+内置启发式在真实标注(120 正 / 2 负)上 100% 复现人工标签。
+
+脚本只依赖标准库; 读 .xlsx 时需要 pandas+openpyxl, 调用真实 LLM 时需要环境变量 OPENAI_API_KEY。
 """
 from __future__ import annotations
 
@@ -43,34 +48,24 @@ DEFAULT_ID_COL = "id"
 SENT_SPLIT_RE = re.compile(r"[\.!?;:。！？；\n\r]+|\s[•·▪◦‣\-–—]\s")
 
 # ----------------------------------------------------------------------------- #
-# 启发式标注用的风险词(离线 fallback; 真实标注请用 LLM + 提示词)
+# 负样本敏感功效词(健康/安全/杀菌/抗菌/防虫/驱虫/防蛀)。命中即判负样本。
+# 注意: fragrance/scent/freshness/moisture(防潮吸湿) 等普通功能不在此列, 属正样本。
 # ----------------------------------------------------------------------------- #
-SUPERLATIVE_RE = re.compile(
-    r"\b(longest[\s\-]?lasting|most long[\s\-]?lasting|the best|#1|no\.?\s*1)\b", re.I
-)
-HYPE_RE = re.compile(r"\b(very|extremely|amazing|incredible|unbeatable)\b", re.I)
-EFFICACY_RE = re.compile(
-    r"\b(antibacterial|antimicrobial|germ|germs|kills?\s+\d|99\.9%|disinfect|"
-    r"cure|prevents?\s+disease|medical|therapeutic)\b",
+SENSITIVE_RE = re.compile(
+    r"\b("
+    r"moths?|anti[\s\-]?moths?|insects?|pests?|repell(?:ent|ant|ents|ants|ing)?|"
+    r"anti[\s\-]?bacterial|antibacterial|anti[\s\-]?microbial|antimicrobial|"
+    r"germs?|bacteria(?:l)?|microbes?|microbial|"
+    r"disinfect\w*|sanitiz\w*|sanitis\w*|steriliz\w*|sterilis\w*|"
+    r"viruses?|virus|antiviral|mildew|mold|mould|fungal|fungus"
+    r")\b",
     re.I,
 )
-# 品牌/服务"作为主体"才算风险: long-lasting brand / provide long-lasting products /
-# long-lasting service。注意 "guarantee a soft touch"(动词)等不算品牌承诺。
-BRAND_SERVICE_RE = re.compile(
-    r"(long[\s\-]?lasting brand|"
-    r"we\s+(?:are|provide|offer)[^.]{0,40}long[\s\-]?lasting|"
-    r"(?:provide|providing|offer|offering)\s+long[\s\-]?lasting\s+products?|"
-    r"long[\s\-]?lasting\s+(?:service|after[\s\-]?sales|warranty\b))",
-    re.I,
-)
-# 平台敏感/售后内容(真正的风险信号; 不含 "replacement parts" 这类产品名)
-PLATFORM_RE = re.compile(
-    r"(contact us|contact (?:the )?seller|e-?mail us|whatsapp|refund|reembolso|"
-    r"money[\s\-]?back|leave (?:a )?review|5\s*stars?|feedback|cup[oó]n|coupon|"
-    r"discount|free gift|free replacement|replacement (?:warranty|guarantee))",
-    re.I,
-)
+# 中文同义敏感表达(原文可能为多语)
+SENSITIVE_ZH = ["驱虫", "防虫", "杀虫", "防蛀", "防蠹", "杀菌", "抗菌", "灭菌",
+                "消毒", "病菌", "细菌", "病毒", "霉菌", "除螨", "驱蚊", "防螨"]
 
+# 启发式给正样本估 confidence 用的"普通属性"线索
 MATERIAL_HINTS = [
     "stainless steel", "304", "925", "sterling silver", "silicone", "tpu", "nylon",
     "polyester", "latex", "cotton", "wool", "ceramic", "rubber", "vinyl", "wood",
@@ -82,12 +77,6 @@ SPEC_RE = re.compile(
     r"gsm|mils?|mm|cm))\b",
     re.I,
 )
-ATTR_HINTS = [
-    "durable", "durability", "resistant", "resistance", "waterproof", "wear-resistant",
-    "wear resisting", "fade", "rust", "corrosion", "breathable", "sturdy", "reusable",
-    "reliable", "reliability", "performance", "longevity", "lifespan", "shine",
-    "color", "colour", "fragrance", "scent", "finish", "freshness",
-]
 
 
 # ----------------------------------------------------------------------------- #
@@ -131,7 +120,7 @@ def split_segments(text: str) -> list[str]:
     """把整段文案切成句子片段, 保证每个返回片段最多含一个 long-lasting 关键词。
 
     若某句含 >1 个关键词, 则围绕每个关键词单独成段(带左右邻句作为上下文窗口),
-    以避免材料/规格证据被标点切断导致误判。
+    以避免材料/功效证据被标点切断导致误判。
     """
     raw = [s.strip() for s in SENT_SPLIT_RE.split(text or "") if s and s.strip()]
     segments: list[str] = []
@@ -140,15 +129,12 @@ def split_segments(text: str) -> list[str]:
         if not hits:
             continue
         prev = raw[idx - 1] if idx > 0 else ""
-        nxt = raw[idx + 1] if idx + 1 < len(raw) else ""
         if len(hits) == 1:
-            # 上下文窗口: 句子较短(可能丢材料证据)时带上相邻句
             seg = sent
-            if len(sent) < 40 and prev:
+            if len(sent) < 40 and prev:  # 句子过短时带上一句作为上下文
                 seg = f"{prev}. {sent}"
             segments.append(_clean(seg))
         else:
-            # 多关键词: 拆成更细的子片段, 每段一个关键词
             for piece in _one_keyword_pieces(sent):
                 segments.append(_clean(piece))
     return [s for s in segments if s]
@@ -221,64 +207,59 @@ def _cap_by_feature(samples: list[dict], cap: int) -> list[dict]:
 
 def _guess_feature(text: str) -> str:
     low = text.lower()
-    if SPEC_RE.search(text):
-        return "spec_number"
-    if any(m in low for m in MATERIAL_HINTS):
-        return "material"
-    if any(a in low for a in ("shine", "color", "colour", "fragrance", "scent", "finish")):
-        return "appearance"
-    if any(a in low for a in ATTR_HINTS):
-        return "attribute"
+    if is_sensitive(text):
+        return "negative_efficacy"
+    if any(w in low for w in ("fragrance", "scent", "diffus")):
+        return "fragrance"
+    if any(w in low for w in ("battery", "mah", "light", "hours", "charge")):
+        return "battery_runtime"
+    if any(w in low for w in ("color", "colour", "shine", "fade", "print", "design")):
+        return "color_appearance"
+    if any(w in low for w in ("coating", "nonstick", "non-stick", "waterproof",
+                              "wear", "rust", "corrosion", "reuse", "reusable")):
+        return "coating_durable"
+    if SPEC_RE.search(text) or any(m in low for m in MATERIAL_HINTS):
+        return "material_spec"
     return "generic_durability"
 
 
 # ----------------------------------------------------------------------------- #
 # label 子命令
 # ----------------------------------------------------------------------------- #
+def is_sensitive(text: str) -> list[str]:
+    """返回命中的敏感功效词列表(健康/杀菌/抗菌/防虫/驱虫/防蛀); 空列表表示无。"""
+    hits = [m.group(0) for m in SENSITIVE_RE.finditer(text)]
+    hits += [w for w in SENSITIVE_ZH if w in text]
+    return sorted(set(hits))
+
+
 def heuristic_label(text: str) -> dict:
-    """离线启发式标注, 对齐提示词决策树(用于无 API 时试跑, 非最终标准)。
+    """离线启发式标注, 对齐提示词决策规则(用于无 API 时试跑, 非最终标准)。
 
-    根据真实人工标注校准: 超高级/主观夸大词只有在**缺乏材料/规格/耐用属性支撑**(纯夸大)时才判负;
-    若仍落在真实物理耐用性上, 则仍为正样本。硬风险: 功效健康、品牌/服务主体、平台敏感售后。
+    命中健康/安全/杀菌/抗菌/防虫/驱虫/防蛀等敏感功效 -> 负样本; 否则 -> 正样本。
     """
+    risk = is_sensitive(text)
+    if risk:
+        return {
+            "label": "负样本",
+            "risk_terms": risk,
+            "reason": "long-lasting 与健康/杀菌/抗菌/防虫/驱虫/防蛀等敏感功效绑定, 属高合规风险。",
+            "confidence": 0.95,
+        }
+
     low = text.lower()
-    has_material = any(m in low for m in MATERIAL_HINTS)
-    has_spec = bool(SPEC_RE.search(text))
-    has_attr = any(a in low for a in ATTR_HINTS)
-    substance = has_material or has_spec or has_attr
-
-    # 1) 硬风险: 功效健康 / 平台敏感 / 品牌服务主体 -> 负
-    hard: list[str] = []
-    hard.extend(m.group(0) for m in EFFICACY_RE.finditer(text))
-    hard.extend(m.group(0) for m in PLATFORM_RE.finditer(text))
-    hard.extend(m.group(0) for m in BRAND_SERVICE_RE.finditer(text))
-    if hard:
-        return {
-            "label": "负样本",
-            "risk_terms": sorted(set(hard)),
-            "reason": "命中功效健康/品牌服务承诺/平台敏感售后等硬风险, 偏离物理耐用性落点。",
-            "confidence": 0.93,
-        }
-
-    # 2) 超高级/主观夸大: 仅在无耐用性实质支撑(纯夸大)时才判负
-    hype = [m.group(0) for m in SUPERLATIVE_RE.finditer(text)]
-    hype += [m.group(0) for m in HYPE_RE.finditer(text)]
-    if hype and not substance:
-        return {
-            "label": "负样本",
-            "risk_terms": sorted(set(hype)),
-            "reason": "主观夸大/最高级词且无材料/规格/耐用属性支撑, 属泛化夸赞。",
-            "confidence": 0.88,
-        }
-
-    # 3) 落点为物理耐用性 -> 正
-    if has_material or has_spec:
-        conf, reason = 0.95, "long-lasting 绑定具体材料/可验证规格, 属客观耐用性描述。"
-    elif has_attr:
-        conf, reason = 0.9, "long-lasting 绑定客观耐用属性(durable/resistant 等)。"
+    if SPEC_RE.search(text) or any(m in low for m in MATERIAL_HINTS) \
+            or any(w in low for w in ("battery", "coating", "nonstick", "fragrance",
+                                      "scent", "color", "colour", "shine")):
+        conf = 0.94
     else:
-        conf, reason = 0.84, "表述较泛但落点为耐用性/寿命, 无其它风险, 按宽松标准判正。"
-    return {"label": "正样本", "risk_terms": [], "reason": reason, "confidence": conf}
+        conf = 0.85
+    return {
+        "label": "正样本",
+        "risk_terms": [],
+        "reason": "long-lasting 描述普通商品属性/耐用性/续航/颜色香味/涂层等, 无敏感功效词。",
+        "confidence": conf,
+    }
 
 
 def llm_label(records: list[dict], model: str, batch: int) -> list[dict]:

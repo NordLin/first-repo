@@ -8,25 +8,28 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `long_lasting_labeling_prompt.md` | **标注提示词**：判定 `long-lasting` 为正样本/负样本（决策树 + 真实示例 + 统一 JSON 输出） |
+| `long_lasting_labeling_prompt.md` | **标注提示词**：判定 `long-lasting` 为正样本/负样本（决策规则 + 真实示例 + 统一 JSON 输出） |
 | `long_lasting_augmentation_prompt.md` | **数据增强提示词**：某特征真实样本不足 50 条时按特征生成补充样本，反同质化 |
 | `long_lasting_pipeline.py` | **Python 流水线**：`extract`（筛选+切句+去重+按特征采样）与 `label`（调用提示词标注） |
 
-## 标注标准要点（来自真实人工标注 120 正 / 2 负）
+## 标注标准（来自人工标注 120 正 / 2 负）
 
-`long-lasting` 默认**偏宽松**。判定核心是：`long-lasting` 是否落在**物理耐用性 / 使用寿命 /
-性能 / 外观·颜色·香味·光照保持**上，且是否有“耐用性实质支撑”（材料 / 规格数字 / 客观耐用属性）。
+核心是一条二分规则：
 
-- **正样本**：落点为耐用性，有材料/规格/属性支撑；即便带 `extremely durable`、`best choice`、
-  `quality guarantee`、`provide long-lasting durability` 等措辞也判正；较泛的
-  `ensures long-lasting use/performance` 在无其它风险时也判正。
-- **负样本**：① 功效/健康/防护声明（germ protection、antibacterial…）；② 品牌/商家承诺/服务作为主体
-  （long-lasting brand、we provide long-lasting products、long-lasting service/warranty）；
-  ③ 平台敏感/售后绑定（contact us、refund、review、coupon、discount…）；
-  ④ 无实质支撑的纯主观夸大（`A very rich, long-lasting moth repellent kit`）。
+- **正样本**：`long-lasting` 描述**普通商品属性**——材料耐用 / 使用寿命 / 性能、颜色光泽印刷持久、
+  香味·扩香·清新持久（不涉及驱虫杀菌）、电池灯光续航、涂层·非粘·耐磨·防水·耐腐蚀·可重复使用、
+  保鲜密封、普通吸湿防潮。
+- **负样本**：`long-lasting` 与**健康/安全/杀菌/抗菌/防虫/驱虫/防蛀**等功效绑定，例如
+  moth/insect/pest repellent、anti-moth、antibacterial、antimicrobial、germ protection、
+  harmful germs、kills bacteria 等。
 
-> 校准验证：`long_lasting_pipeline.py` 内置的离线启发式标注器在上述 122 条真实标注上
-> **100% 复现人工标签**（含 2 条负样本）。提示词的决策树与该校准保持一致。
+注意：
+- 不要仅因为出现 `long-lasting` 就判负。
+- `fragrance / scent` 本身不是负样本；只有用于驱虫/防蛀/驱避害虫等功效时才判负。
+- 与 germ、bacteria、antibacterial、antimicrobial、moth、repellent、pest、insect 等敏感词绑定时，优先判负。
+
+> 校准验证：`long_lasting_pipeline.py` 内置离线启发式标注器在上述 122 条真实标注上
+> **100% 复现人工标签**（含 2 条负样本）。提示词决策规则与该校准一致。
 
 ## 使用方法
 
@@ -69,10 +72,11 @@ python long_lasting/long_lasting_pipeline.py label \
 ### 3. 数据增强（可选）
 当某特征真实样本不足 50 条时，用 `long_lasting_augmentation_prompt.md` 让 LLM 生成补充样本
 （`id` 用 `aug_` 前缀），再合并进 `long_lasting_samples.jsonl` 一起走第 2 步标注。
+负样本（健康/杀菌/抗菌/防虫/驱虫/防蛀功效类）在真实数据中仅 2 条，几乎一定需要增强。
 
 ## 输出格式（`long_lasting_LLM抽样生成数据.jsonl`，每行一条）
 ```json
-{"id": "123_0", "text": "...原文片段...", "label": "正样本", "risk_terms": [], "reason": "...", "confidence": 0.95}
+{"id": "123_0", "text": "...原文片段...", "label": "正样本", "risk_terms": [], "reason": "...", "confidence": 0.94}
 ```
 
 ## 依赖
@@ -83,5 +87,3 @@ python long_lasting/long_lasting_pipeline.py label \
 ## 备注
 - 首个上传文件（`long-lasting________78d0.csv`）为 `%TSD-Header-###%` 加密容器，且约 62% 字节被
   UTF-8 替换字符（U+FFFD）破坏，不可恢复；本工具集依据可读的第二个导出（120 正 / 2 负）构建。
-- 负样本在真实数据中极少（仅 2 条），品牌/服务承诺、平台敏感绑定、最高级绝对化等负样本子类
-  几乎都需要靠增强提示词补足，且务必反同质化。
