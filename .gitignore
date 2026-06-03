@@ -2,3 +2,6 @@ access.log
 *.log
 file1.txt
 temp/
+# Python
+__pycache__/
+*.pyc
